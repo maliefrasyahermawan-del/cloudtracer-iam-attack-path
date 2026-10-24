@@ -1,0 +1,553 @@
+================================================================================
+  CLOUDTRACER — PANDUAN LENGKAP PENGGUNAAN
+  AWS IAM Attack Path Visualizer
+================================================================================
+
+Dibuat oleh  : Alif (Portfolio Project 9)
+Tanggal      : 2026
+Versi        : 1.0.0
+Python       : 3.11+ (tested on 3.14)
+
+================================================================================
+  APA ITU CLOUDTRACER?
+================================================================================
+
+CloudTracer adalah tool keamanan cloud (cloud security tool) yang digunakan
+untuk memvisualisasikan jalur serangan (attack path) pada environment AWS IAM
+(Identity and Access Management).
+
+Secara sederhana, CloudTracer menjawab pertanyaan:
+  "Apakah user/role ini bisa mendapatkan hak Administrator
+   melalui jalur yang tidak langsung?"
+
+Ini sangat berguna untuk:
+  - Cloud Security Audit          → audit konfigurasi IAM sebelum production
+  - Red Team IAM Assessment       → simulasi jalur eskalasi privilege
+  - Threat Modeling               → pemetaan risiko permission AWS
+  - Edukasi AWS Security          → belajar memahami model permission AWS
+
+--------------------------------------------------------------------------------
+
+================================================================================
+  FUNGSI UTAMA TOOL INI
+================================================================================
+
+1. PARSE IAM DATA
+   Membaca file JSON yang berisi konfigurasi seluruh IAM sebuah akun AWS,
+   mencakup: Users, Groups, Roles, dan Policies beserta isi dokumen policy-nya.
+
+2. BUILD ATTACK GRAPH
+   Membangun directed graph (graf berarah) yang merepresentasikan hubungan
+   antar entitas IAM:
+   - Siapa member group mana
+   - Policy apa yang melekat ke user/group/role
+   - Action berbahaya apa yang diizinkan policy tersebut
+   - Role mana yang bisa di-assume oleh siapa
+
+3. FIND ATTACK PATHS
+   Mencari semua jalur dari setiap user/role menuju "target berbahaya" seperti:
+   - AdministratorAccess
+   - iam:PassRole, iam:AttachUserPolicy, iam:CreateUser
+   - sts:AssumeRole ke role yang punya akses admin
+   Menggunakan algoritma BFS (Breadth-First Search) dengan cutoff 5 hop.
+
+4. RISK SCORING
+   Menghitung skor risiko (0-100) untuk setiap entitas berdasarkan:
+   - Jarak ke target berbahaya (hop count)
+   - Permission berbahaya yang dimiliki
+   - Trust policy yang terlalu terbuka
+
+   Label risiko:
+   CRITICAL  = skor 80-100  (merah)
+   HIGH      = skor 60-79   (oranye)
+   MEDIUM    = skor 40-59   (kuning)
+   LOW       = skor 0-39    (hijau)
+
+5. VISUALISASI INTERAKTIF
+   Menghasilkan file HTML yang bisa dibuka di browser berisi graph interaktif:
+   - Klik dan drag node
+   - Hover untuk melihat detail permissions
+   - Node lebih besar = risiko lebih tinggi
+   - Warna node = tingkat risiko
+
+================================================================================
+  ARSITEKTUR SISTEM
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                          CLOUDTRACER                                │
+│                                                                     │
+│  INPUT                    PROCESSING PIPELINE                OUTPUT │
+│  ─────                    ──────────────────────             ────── │
+│                                                                     │
+│  iam_dump.json  ──►  iam_parser.py                                  │
+│  (AWS CLI JSON)       │  Parse Users/Groups                         │
+│                        │  Roles/Policies                            │
+│                        ▼                                            │
+│                   graph_builder.py                                  │
+│                        │  Bangun NetworkX DiGraph                   │
+│                        │  Node: user/role/group/policy/permission   │
+│                        │  Edge: MemberOf/Attached/Allows/CanAssume  │
+│                        ▼                                            │
+│                   path_finder.py                                    │
+│                        │  BFS all_simple_paths (cutoff=5)           │
+│                        │  Cari jalur ke target berbahaya            │
+│                        ▼                                            │
+│                   risk_scorer.py    ──►  scores dict                │
+│                        │  Hitung skor 0-100 per entitas             │
+│                        │  Label: CRITICAL/HIGH/MEDIUM/LOW           │
+│                        ▼                                            │
+│                   visualizer.py     ──►  graph.html   ◄── BROWSER  │
+│                        │  Pyvis Network → HTML interaktif            │
+│                        │  Dark theme, physics simulation             │
+│                        ▼                                            │
+│                   findings.json     ──►  list attack paths          │
+│                   risk_summary.txt  ──►  ringkasan teks             │
+│                                                                     │
+│  ┌──────────────┐       ┌──────────────────────────────────┐        │
+│  │   CLI Mode   │       │        Web Server Mode           │        │
+│  │  cli.py      │       │  main.py (FastAPI + Uvicorn)     │        │
+│  │  (No server) │       │  REST API + index.html UI        │        │
+│  └──────────────┘       └──────────────────────────────────┘        │
+└─────────────────────────────────────────────────────────────────────┘
+
+--------------------------------------------------------------------------------
+
+STRUKTUR FOLDER:
+  cloudtracer/
+  ├── app/
+  │   ├── main.py           → FastAPI web server, semua endpoint REST
+  │   ├── iam_parser.py     → Parse JSON IAM dump → struktur Python
+  │   ├── graph_builder.py  → Bangun NetworkX directed graph
+  │   ├── path_finder.py    → Cari attack paths dengan BFS
+  │   ├── risk_scorer.py    → Hitung risk score per entitas
+  │   └── visualizer.py     → Generate Pyvis HTML graph
+  ├── cli.py                → CLI tanpa web server
+  ├── static/
+  │   └── index.html        → Web UI (upload + dashboard)
+  ├── sample_data/
+  │   └── sample_iam_dump.json  → Contoh data IAM dengan vuln config
+  ├── output/               → Hasil: graph.html, findings.json, summary
+  ├── requirements.txt
+  ├── run.py                → Entry point uvicorn
+  └── README.md
+
+================================================================================
+  CARA MENDAPATKAN FILE IAM DUMP
+================================================================================
+
+CARA 1 — Dari AWS CLI (akun AWS nyata):
+  Pastikan sudah configure AWS credentials:
+    aws configure
+
+  Lalu jalankan:
+    aws iam get-account-authorization-details --output json > iam_dump.json
+
+  Perintah ini mengambil seluruh konfigurasi IAM akun AWS kamu,
+  termasuk semua user, group, role, dan policy beserta isinya.
+
+  PERHATIAN: Perintah ini membutuhkan permission:
+    iam:GetAccountAuthorizationDetails
+  Biasanya hanya bisa dijalankan oleh akun dengan hak tinggi (admin).
+
+CARA 2 — Dari LocalStack (simulasi AWS di lokal):
+  LocalStack adalah tools untuk mensimulasikan AWS secara lokal.
+  Setelah LocalStack berjalan:
+    aws --endpoint-url=http://localhost:4566 iam get-account-authorization-details > iam_dump.json
+
+CARA 3 — Gunakan sample data yang sudah disertakan:
+  File: sample_data/sample_iam_dump.json
+  Sudah berisi skenario IAM realistis dengan konfigurasi berbahaya.
+  Cocok untuk demo dan latihan tanpa perlu akun AWS.
+
+================================================================================
+  INSTALASI
+================================================================================
+
+LANGKAH 1 — Pastikan Python terinstall:
+  Buka Command Prompt atau PowerShell, ketik:
+    python --version
+  Harus muncul: Python 3.11 atau lebih baru.
+
+LANGKAH 2 — Pindah ke folder project:
+  cd "D:\Portofolio Cyber Alif\Project 9 - Cloud Tracer\cloudtracer"
+
+LANGKAH 3 — Install dependencies:
+  pip install -r requirements.txt
+
+  Paket yang akan diinstall:
+  - fastapi        → web framework untuk REST API
+  - uvicorn        → ASGI server untuk menjalankan FastAPI
+  - networkx       → library graph untuk Python
+  - pyvis          → generate HTML interaktif dari NetworkX graph
+  - python-multipart → handle file upload di FastAPI
+
+LANGKAH 4 — Verifikasi instalasi:
+  python -c "import fastapi, networkx, pyvis; print('OK')"
+  Jika muncul "OK" berarti semua sudah terinstall dengan benar.
+
+================================================================================
+  CARA PENGGUNAAN — MODE WEB (Direkomendasikan)
+================================================================================
+
+MODE INI: Buka web browser, upload file JSON, lihat hasil di UI.
+
+LANGKAH 1 — Jalankan server:
+  Buka PowerShell/CMD di folder cloudtracer, lalu:
+    python run.py
+
+  Output yang muncul:
+    INFO:     Started server process
+    INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+
+LANGKAH 2 — Buka browser:
+  Buka Chrome atau Firefox, ketik di address bar:
+    http://localhost:8000
+
+  Akan muncul halaman upload CloudTracer.
+
+LANGKAH 3 — Upload file IAM:
+  - Drag and drop file .json ke area upload
+  - ATAU klik tombol "Browse File" dan pilih file
+  - Gunakan: sample_data/sample_iam_dump.json untuk demo
+
+LANGKAH 4 — Lihat hasil analisis:
+  Setelah upload selesai, akan muncul:
+  - Kartu summary: jumlah CRITICAL, HIGH, MEDIUM, LOW, dan total attack paths
+  - Tabel "Top Attack Paths": daftar jalur serangan terurut by risk score
+
+LANGKAH 5 — Buka Attack Graph:
+  Klik tombol "Open Attack Graph"
+  Graph interaktif akan terbuka di tab baru.
+
+LANGKAH 6 — Gunakan Attack Graph:
+  - DRAG node untuk memindahkan posisi
+  - HOVER node untuk melihat tooltip berisi:
+      · Tipe entitas (user/role/group/policy/permission)
+      · Risk score dan label
+      · Alasan kenapa risikonya tinggi
+      · Daftar permissions yang dimiliki
+  - SCROLL untuk zoom in/out
+  - Klik "Physics" panel (bawah kiri) untuk pause/resume simulasi fisika
+
+LANGKAH 7 — Download findings:
+  Klik tombol "Download findings.json"
+  File JSON berisi semua attack path terurut by risk score.
+
+MENGHENTIKAN SERVER:
+  Tekan CTRL+C di terminal tempat server berjalan.
+
+================================================================================
+  CARA PENGGUNAAN — MODE CLI (Tanpa Web Server)
+================================================================================
+
+MODE INI: Jalankan dari terminal, output langsung ke file + terminal.
+Cocok untuk automation, scripting, atau tidak mau menjalankan server.
+
+PERINTAH DASAR:
+  python cli.py --input sample_data/sample_iam_dump.json --output output/
+
+PARAMETER:
+  --input  / -i   : Path ke file IAM JSON dump (WAJIB)
+  --output / -o   : Folder tujuan output (default: output/)
+
+CONTOH PENGGUNAAN:
+
+  1. Analisis sample data (demo):
+     python cli.py --input sample_data/sample_iam_dump.json
+
+  2. Analisis file IAM kamu sendiri:
+     python cli.py --input C:\Users\kamu\Downloads\iam_dump.json --output C:\hasil\
+
+  3. Simpan output ke folder tertentu:
+     python cli.py -i iam_dump.json -o hasil_audit/
+
+OUTPUT YANG DIHASILKAN:
+  Terminal akan menampilkan:
+  - Ringkasan parsing (jumlah user, group, role, policy)
+  - Jumlah node dan edge di graph
+  - Jumlah attack path yang ditemukan
+  - Tabel ASCII top attack paths
+  - Risk summary (CRITICAL/HIGH/MEDIUM/LOW count)
+
+  File yang disimpan di folder output/:
+  - graph.html        → Buka di browser untuk lihat graph interaktif
+  - findings.json     → Semua attack path dalam format JSON
+  - risk_summary.txt  → Ringkasan 1 baris untuk keperluan reporting
+
+MEMBUKA GRAPH DARI CLI:
+  Setelah CLI selesai, copy path yang muncul:
+    file:///D:/Portofolio Cyber Alif/.../cloudtracer/output/graph.html
+  Paste ke address bar browser.
+
+================================================================================
+  MEMAHAMI OUTPUT — ATTACK GRAPH
+================================================================================
+
+WARNA NODE:
+  Merah terang     → CRITICAL risk (skor 80-100)
+  Oranye           → HIGH risk (skor 60-79)
+  Kuning           → MEDIUM risk (skor 40-59)
+  Hijau            → LOW risk (skor 0-39) untuk user/role
+  Biru             → User (default, sebelum scoring)
+  Abu-abu          → Policy node
+  Merah solid      → Permission berbahaya
+
+UKURAN NODE:
+  Semakin BESAR node = semakin TINGGI risk score-nya.
+  Formula: ukuran = 15 + (risk_score / 5)
+
+WARNA EDGE (Garis penghubung):
+  Ungu             → CanAssume (bisa melakukan AssumeRole)
+  Biru             → MemberOf (user adalah anggota group)
+  Abu-abu muda     → DirectlyAttached (policy langsung ke user)
+  Oranye           → GroupAttached (policy melekat via group)
+  Hijau            → RoleAttached (policy melekat ke role)
+  Merah            → Allows (policy mengizinkan action berbahaya)
+
+CARA MEMBACA ATTACK PATH:
+  Contoh temuan: user:alice → group:developers → policy:DevPolicy → permission:iam:passrole
+
+  Artinya:
+  1. alice adalah anggota group "developers"
+  2. Group "developers" punya policy "DevPolicy"
+  3. DevPolicy mengizinkan action "iam:PassRole"
+  4. Dengan iam:PassRole, alice bisa memberikan role ke Lambda/EC2
+     yang punya AdministratorAccess → eskalasi privilege!
+
+================================================================================
+  MEMAHAMI OUTPUT — FINDINGS.JSON
+================================================================================
+
+Setiap temuan dalam findings.json memiliki struktur:
+
+  {
+    "source": "user:bob",                    ← Entitas sumber (korban/attacker)
+    "target": "permission:iam:passrole",     ← Target berbahaya yang bisa dicapai
+    "shortest_path": [                       ← Jalur terpendek ke target
+      "user:bob",
+      "policy:DevPolicy",
+      "permission:iam:passrole"
+    ],
+    "hop_count": 2,                          ← Jumlah langkah (2 = lebih berbahaya)
+    "path_count": 1,                         ← Jumlah jalur alternatif
+    "risk_score": 63,                        ← Skor risiko 0-100
+    "risk_label": "HIGH",                    ← CRITICAL/HIGH/MEDIUM/LOW
+    "reasons": [                             ← Alasan scoring
+      "2 hops to dangerous target (+25)",
+      "iam:PassRole on * (+20)",
+      "iam:AttachUserPolicy (+18)"
+    ]
+  }
+
+PRIORITAS PENANGANAN:
+  1. Perbaiki dulu semua yang CRITICAL (skor 80+)
+  2. Lanjut ke HIGH (skor 60-79)
+  3. Review MEDIUM sebagai backlog
+  4. LOW bisa diterima tapi tetap dicatat
+
+================================================================================
+  SKENARIO SAMPLE DATA (sample_iam_dump.json)
+================================================================================
+
+Sample data yang disertakan mensimulasikan IAM environment fiktif dengan
+konfigurasi berbahaya yang sering ditemukan di real-world audit:
+
+ENTITAS YANG ADA:
+
+  USER: alice
+  - Normal user, tidak punya policy langsung
+  - Anggota group "developers"
+  - RISIKO: Bisa eskalasi privilege via group (3 hop)
+  - Score: LOW (15)
+
+  USER: bob
+  - Developer, punya DevPolicy langsung (direct attach)
+  - DevPolicy mengandung: iam:PassRole + iam:AttachUserPolicy
+  - RISIKO TINGGI: 2 hop ke permission berbahaya
+  - Score: HIGH (63)
+
+  USER: charlie
+  - Tim billing, hanya punya BillingReadOnly
+  - Tidak ada permission berbahaya
+  - Score: LOW (15)
+
+  GROUP: developers
+  - alice dan bob adalah anggotanya
+  - Punya DevPolicy (berisi iam:PassRole dan iam:AttachUserPolicy)
+
+  ROLE: admin-role
+  - Punya AdministratorAccess (policy AWS managed)
+  - Trust policy: hanya akun root yang bisa assume
+  - Score: HIGH (75) — sudah punya admin, tapi bukan "bisa dicapai dari luar"
+
+  ROLE: lambda-exec-role
+  - Trust policy TERLALU TERBUKA: "Principal": {"AWS": "*"}
+  - Siapapun bisa AssumeRole ke role ini!
+  - Punya inline policy: iam:PassRole + sts:AssumeRole ke *
+  - Score: CRITICAL (92) — kombinasi trust terbuka + dangerous permissions
+
+ATTACK PATH UTAMA yang bisa ditemukan:
+
+  PATH 1 (via bob):
+  user:bob → policy:DevPolicy → permission:iam:passrole
+  [2 hop, HIGH]
+  Bob bisa PassRole ke admin-role karena DevPolicy allow * resource
+
+  PATH 2 (via alice):
+  user:alice → group:developers → policy:DevPolicy → permission:iam:passrole
+  [3 hop, LOW]
+  Alice bisa eskalasi tapi butuh lebih banyak langkah
+
+  PATH 3 (lambda-exec-role):
+  role:lambda-exec-role → policy:inline → permission:iam:passrole
+  [2 hop, CRITICAL]
+  Role ini punya trust terbuka ("*") + langsung bisa PassRole
+
+================================================================================
+  API ENDPOINTS (Mode Web)
+================================================================================
+
+Setelah server berjalan (python run.py), tersedia endpoint berikut:
+
+  GET  http://localhost:8000/
+  → Halaman utama web UI (upload form)
+
+  POST http://localhost:8000/upload
+  → Upload file IAM JSON
+  → Request: multipart/form-data dengan field "file"
+  → Response: {"job_id": "abc12345", "summary": "...", "finding_counts": {...}}
+
+  GET  http://localhost:8000/graph/{job_id}
+  → Tampilkan graph HTML interaktif untuk job tersebut
+  → Buka langsung di browser
+
+  GET  http://localhost:8000/findings/{job_id}
+  → Ambil findings.json sebagai response JSON
+  → Cocok untuk integrasi dengan tools lain
+
+  GET  http://localhost:8000/summary/{job_id}
+  → Ringkasan risiko dalam format teks
+
+  GET  http://localhost:8000/health
+  → Health check: {"status": "ok"}
+
+CONTOH DENGAN CURL (jika mau testing API langsung):
+  # Upload file
+  curl -X POST http://localhost:8000/upload \
+    -F "file=@sample_data/sample_iam_dump.json"
+
+  # Ambil findings (ganti abc12345 dengan job_id dari response upload)
+  curl http://localhost:8000/findings/abc12345
+
+================================================================================
+  TROUBLESHOOTING
+================================================================================
+
+MASALAH: "ModuleNotFoundError: No module named 'pyvis'"
+SOLUSI:  pip install pyvis
+
+MASALAH: "ModuleNotFoundError: No module named 'fastapi'"
+SOLUSI:  pip install fastapi uvicorn[standard] python-multipart
+
+MASALAH: "Address already in use" saat run.py
+SOLUSI:  Port 8000 sudah dipakai proses lain. Ubah port di run.py:
+         uvicorn.run("app.main:app", port=8001, reload=True)
+
+MASALAH: Graph HTML tidak muncul / blank di browser
+SOLUSI:
+  - Pastikan file graph.html ada di folder output/{job_id}/
+  - Coba buka dengan Chrome (bukan IE/Edge lama)
+  - Disable browser extensions yang memblokir JavaScript
+
+MASALAH: "JSON does not appear to be an IAM dump"
+SOLUSI:  File JSON yang diupload harus memiliki setidaknya salah satu dari:
+         UserDetailList, GroupDetailList, RoleDetailList, Policies
+         Periksa apakah file dari perintah yang benar.
+
+MASALAH: "0 attack paths found" padahal ada data
+SOLUSI:  Kemungkinan tidak ada policy berbahaya yang dikenali.
+         Pastikan policy document berisi action seperti:
+         iam:PassRole, iam:AttachUserPolicy, sts:AssumeRole, iam:*, *
+
+MASALAH: "Permission denied" saat jalankan perintah AWS CLI
+SOLUSI:  Akun AWS kamu tidak punya iam:GetAccountAuthorizationDetails.
+         Minta admin untuk memberikan permission tersebut, atau gunakan
+         sample data untuk latihan.
+
+================================================================================
+  CATATAN KEAMANAN & ETIKA
+================================================================================
+
+! PENTING — BACA SEBELUM MENGGUNAKAN !
+
+1. Tool ini HANYA boleh digunakan pada:
+   - Akun AWS milikmu sendiri
+   - Akun yang kamu memiliki izin tertulis untuk diaudit
+   - Environment lab/testing (LocalStack, sandbox account)
+   - CTF (Capture The Flag) competition
+   - Tujuan edukasi dan portfolio
+
+2. Menggunakan tool ini tanpa izin pada akun AWS milik orang lain
+   adalah ILEGAL dan melanggar:
+   - Computer Fraud and Abuse Act (CFAA) di AS
+   - UU ITE di Indonesia
+   - Terms of Service AWS
+
+3. File iam_dump.json bisa berisi informasi sensitif tentang
+   konfigurasi keamanan akun AWS. Jangan share/upload ke tempat publik.
+
+4. Output (graph.html, findings.json) juga mengandung informasi
+   konfigurasi IAM. Simpan dengan aman.
+
+================================================================================
+  REFERENSI & RESOURCES
+================================================================================
+
+AWS IAM Documentation:
+  https://docs.aws.amazon.com/IAM/latest/UserGuide/
+
+AWS IAM Privilege Escalation Techniques (referensi edukasi):
+  https://rhinosecuritylabs.com/aws/aws-privilege-escalation-methods-mitigation/
+
+NetworkX Documentation:
+  https://networkx.org/documentation/stable/
+
+Pyvis Documentation:
+  https://pyvis.readthedocs.io/
+
+CloudTracer GitHub/Portfolio:
+  Project 9 - Cloud Tracer (Portofolio Cyber Alif)
+
+================================================================================
+  QUICK REFERENCE (Cheat Sheet)
+================================================================================
+
+INSTALL:
+  pip install -r requirements.txt
+
+WEB MODE:
+  python run.py
+  → Buka http://localhost:8000
+
+CLI MODE:
+  python cli.py --input <file.json> --output <folder/>
+  python cli.py --input sample_data/sample_iam_dump.json
+
+GENERATE IAM DUMP (AWS):
+  aws iam get-account-authorization-details --output json > iam_dump.json
+
+RISK LABELS:
+  CRITICAL = 80-100  |  HIGH = 60-79  |  MEDIUM = 40-59  |  LOW = 0-39
+
+BERBAHAYA JIKA DITEMUKAN:
+  iam:*              → Kontrol penuh atas IAM
+  *                  → Kontrol penuh atas semua AWS services
+  iam:PassRole       → Bisa eskalasi via Lambda/EC2/dll
+  iam:AttachUserPolicy → Bisa attach policy apapun ke user manapun
+  sts:AssumeRole ke * → Bisa assume role apapun
+  Trust Principal "*" → Role bisa di-assume oleh siapapun di internet
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
